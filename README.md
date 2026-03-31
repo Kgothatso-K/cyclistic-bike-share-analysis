@@ -93,3 +93,11 @@ See the complete analysis and report in:
 `cyclistic_analysis.qmd`  
 
 (Render to HTML for best viewing experience)
+
+---
+
+## Data Source
+
+The dataset used in this analysis is publicly available from the Cyclistic (Divvy) bike-share system. Due to file size constraints, raw data is not included in this repository.
+
+You can download the dataset here: https://divvy-tripdata.s3.amazonaws.com/index.html
