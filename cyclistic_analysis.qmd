@@ -1,0 +1,623 @@
+---
+title: "Cyclistic Bike-Share Analysis"
+subtitle: "Professional Portfolio Case Study"
+author: "Your Name"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: false
+    code-summary: "Show code"
+    df-print: paged
+    embed-resources: false
+    theme: cosmo
+    output-dir: docs
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  error: false
+---
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(DBI)
+library(RSQLite)
+library(scales)
+library(skimr)
+library(naniar)
+```
+
+# Relative paths
+
+```{r}
+raw_data_path <- "data/raw"
+visuals_path  <- "visuals"
+```
+
+# Global options
+
+```{r}
+options(scipen = 999)
+theme_set(theme_minimal())
+```
+
+# Introduction
+
+Cyclistic is a bike-share company that offers flexible transportation options to a diverse user base, including casual riders and annual members. While casual riders generate short-term revenue, annual members provide more stable and predictable income, making membership growth a key strategic priority for the business.
+
+This analysis investigates behavioural differences between casual riders and annual members using 12 months of trip-level data. The objective is to identify patterns in usage, timing, and ride characteristics that can inform targeted strategies for converting casual users into annual members.
+
+To achieve this, the project follows a structured analytical workflow, including data ingestion, cleaning, feature engineering, exploratory analysis, and visualisation. The analysis is designed not only to describe rider behaviour, but to generate actionable insights that directly support Cyclistic’s membership growth strategy.
+
+The final output is a reproducible, end-to-end analytical pipeline implemented in Quarto, combining R and SQL to ensure both technical rigour and business relevance.
+
+# Data Ingestion
+
+This section loads the monthly Cyclistic trip files from the raw data folder, checks whether the files share a consistent structure, and combines them into one analysis dataset for further cleaning and transformation.
+
+```{r}
+csv_files <- list.files(
+  path = raw_data_path,
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+csv_files
+```
+
+```{r}
+read_cyclistic_file <- function(file_path) {
+  read_csv(file_path, show_col_types = FALSE) %>%
+    clean_names() %>%
+    mutate(source_file = basename(file_path))
+}
+```
+
+```{r}
+cyclistic_list <- map(csv_files, read_cyclistic_file)
+```
+
+```{r}
+column_names_list <- map(cyclistic_list, names)
+
+reference_columns <- column_names_list[[1]]
+
+schema_check <- tibble(
+  file = basename(csv_files),
+  matches_reference = map_lgl(column_names_list, ~ identical(.x, reference_columns)),
+  column_count = map_int(column_names_list, length)
+)
+
+schema_check
+```
+
+```{r}
+cyclistic_raw <- bind_rows(cyclistic_list)
+```
+
+```{r}
+tibble(
+  total_rows = nrow(cyclistic_raw),
+  total_columns = ncol(cyclistic_raw)
+)
+```
+
+```{r}
+glimpse(cyclistic_raw)
+```
+
+```{r}
+tibble(
+  column = names(cyclistic_raw),
+  data_type = map_chr(cyclistic_raw, ~ class(.x)[1])
+)
+```
+
+```{r}
+cyclistic_raw %>%
+  count(source_file, name = "row_count") %>%
+  arrange(source_file)
+```
+
+```{r}
+missing_summary <- cyclistic_raw %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "column",
+    values_to = "missing_count"
+  ) %>%
+  arrange(desc(missing_count))
+
+missing_summary
+```
+
+```{r}
+skim(cyclistic_raw)
+```
+
+The monthly CSV files were successfully loaded from the raw data folder and combined into a single dataset. A schema consistency check was performed before combining the files to confirm that the column structure was aligned across the monthly extracts. Initial inspection focused on dataset dimensions, imported column types, row counts by source file, and missing-value patterns. This provides the baseline required for data cleaning and validation in the next step.
+
+# Data Cleaning and Validation
+
+This section prepares the dataset for analysis by removing invalid records, handling missing values where necessary, and ensuring consistent formatting across key variables. Cleaning decisions are made conservatively to avoid introducing bias into the analysis.
+
+```{r}
+cyclistic_clean <- cyclistic_raw %>%
+  distinct(ride_id, .keep_all = TRUE)
+```
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  filter(
+    !is.na(ride_id),
+    !is.na(started_at),
+    !is.na(ended_at),
+    !is.na(member_casual),
+    !is.na(rideable_type)
+  )
+```
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  mutate(
+    ride_length_minutes = as.numeric(
+      difftime(ended_at, started_at, units = "mins")
+    )
+  )
+```
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  filter(
+    !is.na(ride_length_minutes),
+    ride_length_minutes > 0
+  )
+```
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  mutate(
+    start_station_name = str_squish(str_to_title(start_station_name)),
+    end_station_name   = str_squish(str_to_title(end_station_name))
+  )
+```
+
+```{r}
+con <- dbConnect(RSQLite::SQLite(), ":memory:")
+dbWriteTable(con, "cyclistic_clean", cyclistic_clean, overwrite = TRUE)
+```
+
+```{sql connection=con}
+SELECT ride_id, COUNT(*) AS count
+FROM cyclistic_clean
+GROUP BY ride_id
+HAVING COUNT(*) > 1;
+```
+
+```{sql connection=con}
+SELECT
+  SUM(CASE WHEN ride_id IS NULL THEN 1 ELSE 0 END) AS ride_id_nulls,
+  SUM(CASE WHEN started_at IS NULL THEN 1 ELSE 0 END) AS started_at_nulls,
+  SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END) AS ended_at_nulls,
+  SUM(CASE WHEN member_casual IS NULL THEN 1 ELSE 0 END) AS member_casual_nulls
+FROM cyclistic_clean;
+```
+
+```{sql connection=con}
+SELECT
+  member_casual,
+  rideable_type,
+  COUNT(*) AS trips
+FROM cyclistic_clean
+GROUP BY member_casual, rideable_type
+ORDER BY member_casual, rideable_type;
+```
+
+```{r}
+tibble(
+  rows_before = nrow(cyclistic_raw),
+  rows_after  = nrow(cyclistic_clean),
+  rows_removed = nrow(cyclistic_raw) - nrow(cyclistic_clean)
+)
+```
+
+Data cleaning focused on removing duplicate records, invalid trip durations, and observations with missing critical fields. Missing values in station-related variables were retained, as they correspond to valid trips without fixed station information. This approach ensures data integrity while preserving the representativeness of rider behaviour.
+
+# Feature Engineering
+
+This section creates derived variables that support behavioural analysis of rider segments. These features capture temporal patterns and usage characteristics that are not directly available in the raw data.
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  mutate(
+    day_of_week = wday(started_at, label = TRUE, abbr = FALSE, week_start = 1),
+    month       = month(started_at, label = TRUE, abbr = FALSE),
+    hour        = hour(started_at)
+  )
+```
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  mutate(
+    is_weekend = if_else(
+      day_of_week %in% c("Saturday", "Sunday"),
+      "Weekend",
+      "Weekday"
+    )
+  )
+```
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  mutate(
+    season = case_when(
+      month %in% c("December", "January", "February") ~ "Winter",
+      month %in% c("March", "April", "May") ~ "Spring",
+      month %in% c("June", "July", "August") ~ "Summer",
+      month %in% c("September", "October", "November") ~ "Autumn"
+    )
+  )
+```
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  mutate(
+    time_of_day = case_when(
+      hour >= 5  & hour < 12 ~ "Morning",
+      hour >= 12 & hour < 17 ~ "Afternoon",
+      hour >= 17 & hour < 21 ~ "Evening",
+      TRUE ~ "Night"
+    )
+  )
+```
+
+```{r}
+cyclistic_clean <- cyclistic_clean %>%
+  mutate(
+    is_weekend = factor(is_weekend, levels = c("Weekday", "Weekend")),
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Autumn")),
+    time_of_day = factor(time_of_day, levels = c("Morning", "Afternoon", "Evening", "Night")),
+    month = factor(
+      month,
+      levels = c(
+        "January","February","March","April","May","June",
+        "July","August","September","October","November","December"
+      )
+    )
+  )
+```
+
+```{r}
+glimpse(cyclistic_clean)
+```
+
+```{r}
+cyclistic_clean %>%
+  summarise(
+    min_duration = min(ride_length_minutes),
+    max_duration = max(ride_length_minutes)
+  )
+```
+
+```{r}
+cyclistic_clean %>% count(day_of_week)
+cyclistic_clean %>% count(is_weekend)
+cyclistic_clean %>% count(season)
+cyclistic_clean %>% count(time_of_day)
+```
+
+Feature engineering introduced time-based variables such as day of week, month, season, and time of day to enable structured behavioural analysis. These features allow for meaningful comparisons between casual riders and members across temporal dimensions, supporting both exploratory analysis and business insight generation. Season classification is based on Northern Hemisphere definitions, as the dataset originates from the USA. This ensures that seasonal patterns are interpreted correctly in the context of local weather and rider behaviour.
+
+# Exploratory Data Analysis
+
+This section examines behavioural differences between casual riders and annual members across key dimensions, including trip duration, temporal usage patterns, and ride characteristics. The goal is to identify systematic differences that can inform business recommendations.
+
+```{r}
+segment_summary <- cyclistic_clean %>%
+  group_by(member_casual) %>%
+  summarise(
+    trips = n(),
+    avg_duration = mean(ride_length_minutes),
+    median_duration = median(ride_length_minutes)
+  )
+
+segment_summary
+```
+
+```{r}
+duration_summary <- cyclistic_clean %>%
+  group_by(member_casual) %>%
+  summarise(
+    min = min(ride_length_minutes),
+    q1 = quantile(ride_length_minutes, 0.25),
+    median = median(ride_length_minutes),
+    mean = mean(ride_length_minutes),
+    q3 = quantile(ride_length_minutes, 0.75),
+    max = max(ride_length_minutes)
+  )
+
+duration_summary
+```
+
+```{r}
+weekday_segment <- cyclistic_clean %>%
+  group_by(member_casual, day_of_week) %>%
+  summarise(trips = n(), .groups = "drop")
+
+weekday_segment
+```
+
+```{r}
+time_of_day_segment <- cyclistic_clean %>%
+  group_by(member_casual, time_of_day) %>%
+  summarise(trips = n(), .groups = "drop")
+
+time_of_day_segment
+```
+
+```{r}
+monthly_segment <- cyclistic_clean %>%
+  group_by(member_casual, month) %>%
+  summarise(trips = n(), .groups = "drop")
+
+season_segment <- cyclistic_clean %>%
+  group_by(member_casual, season) %>%
+  summarise(trips = n(), .groups = "drop")
+
+monthly_segment
+season_segment
+```
+
+```{r}
+bike_type_segment <- cyclistic_clean %>%
+  group_by(member_casual, rideable_type) %>%
+  summarise(trips = n(), .groups = "drop")
+
+bike_type_segment
+```
+
+```{r}
+top_stations <- cyclistic_clean %>%
+  filter(!is.na(start_station_name)) %>%
+  group_by(member_casual, start_station_name) %>%
+  summarise(trips = n(), .groups = "drop") %>%
+  arrange(member_casual, desc(trips)) %>%
+  group_by(member_casual) %>%
+  slice_head(n = 10)
+
+top_stations
+```
+
+```{r}
+dbWriteTable(con, "cyclistic_clean", cyclistic_clean, overwrite = TRUE)
+```
+
+```{sql connection=con}
+SELECT
+  member_casual,
+  time_of_day,
+  COUNT(*) AS trips,
+  ROUND(AVG(ride_length_minutes), 2) AS avg_duration
+FROM cyclistic_clean
+GROUP BY member_casual, time_of_day
+ORDER BY member_casual, trips DESC;
+```
+
+# Visualisations
+
+This section presents key behavioural differences between casual riders and members using clear, focused visualisations. Each chart is designed to highlight patterns that support business decision-making.
+
+```{r}
+segment_colors <- c(
+  "casual" = "#1f77b4",
+  "member" = "#ff7f0e"
+)
+```
+
+```{r}
+plot_monthly <- cyclistic_clean %>%
+  group_by(member_casual, month) %>%
+  summarise(trips = n(), .groups = "drop") %>%
+  ggplot(aes(x = month, y = trips, group = member_casual, color = member_casual)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = segment_colors) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Casual riders show stronger seasonal peaks compared to members",
+    x = NULL,
+    y = "Number of trips",
+    color = "Rider type"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot_monthly
+```
+
+```{r}
+plot_duration <- cyclistic_clean %>%
+  filter(ride_length_minutes <= quantile(ride_length_minutes, 0.99)) %>%
+  ggplot(aes(x = ride_length_minutes, fill = member_casual)) +
+  geom_histogram(bins = 60, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = segment_colors) +
+  labs(
+    title = "Casual riders consistently take longer trips than members",
+    x = "Ride length (minutes)",
+    y = "Trip count",
+    fill = "Rider type"
+  )
+
+plot_duration
+```
+
+```{r}
+plot_weekday <- cyclistic_clean %>%
+  group_by(member_casual, day_of_week) %>%
+  summarise(trips = n(), .groups = "drop") %>%
+  ggplot(aes(x = day_of_week, y = trips, fill = member_casual)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = segment_colors) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Members ride more on weekdays, casual riders peak on weekends",
+    x = NULL,
+    y = "Number of trips",
+    fill = "Rider type"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+plot_weekday
+```
+
+```{r}
+plot_time <- cyclistic_clean %>%
+  group_by(member_casual, time_of_day) %>%
+  summarise(trips = n(), .groups = "drop") %>%
+  ggplot(aes(x = time_of_day, y = trips, fill = member_casual)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = segment_colors) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Usage timing differs between rider segments",
+    x = NULL,
+    y = "Number of trips",
+    fill = "Rider type"
+  )
+
+plot_time
+```
+
+```{r}
+plot_bike <- cyclistic_clean %>%
+  group_by(member_casual, rideable_type) %>%
+  summarise(trips = n(), .groups = "drop") %>%
+  ggplot(aes(x = rideable_type, y = trips, fill = member_casual)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = segment_colors) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Bike type usage differs between casual riders and members",
+    x = "Bike type",
+    y = "Number of trips",
+    fill = "Rider type"
+  )
+
+plot_bike
+```
+
+```{r}
+ggsave(file.path(visuals_path, "monthly_trends.png"), plot_monthly, width = 10, height = 6)
+
+ggsave(file.path(visuals_path, "duration_distribution.png"), plot_duration, width = 10, height = 6)
+```
+
+# Insights
+
+This section translates the analytical findings into structured insights. Each insight is presented using a clear framework that links observed patterns to behavioural interpretation and business implications.
+
+## Casual riders take significantly longer trips than members
+
+**Observation**\
+Casual riders have an average trip duration of approximately 32 minutes compared to 13.6 minutes for members. The median duration also shows a clear gap (16 minutes vs 9.6 minutes), indicating that the difference is consistent across the distribution.
+
+**Interpretation**\
+Casual riders are more likely to use the service for leisure or exploratory purposes, resulting in longer ride durations. In contrast, members exhibit shorter, more consistent trips, suggesting utilitarian use such as commuting or routine travel.
+
+**Business implication**\
+Conversion strategies should reposition membership as a practical and cost-effective option for frequent users, while also highlighting benefits that appeal to casual riders’ longer-duration usage patterns.
+
+## Casual riders are weekend-oriented, while members are weekday-oriented
+
+**Observation**\
+Casual riders show peak usage on Saturdays and Sundays, while member usage is more evenly distributed across weekdays, with higher activity from Monday to Friday.
+
+**Interpretation**\
+Casual usage aligns with leisure and recreational behaviour, whereas member usage aligns with structured, routine travel such as commuting.
+
+**Business implication**\
+Marketing efforts aimed at converting casual riders should focus on weekend engagement points, where casual rider activity is highest. Messaging should emphasise how membership can support more frequent and practical use beyond occasional leisure trips.
+
+## Members exhibit structured daily usage patterns, while casual riders are more flexible
+
+**Observation**\
+Member trips are concentrated in morning, afternoon, and evening periods, indicating consistent daily usage. Casual riders show a stronger concentration in the afternoon and evening, with less pronounced morning activity.
+
+**Interpretation**\
+Member behaviour reflects routine travel patterns, likely tied to commuting or regular schedules. Casual riders exhibit more flexible timing, consistent with leisure or discretionary usage.
+
+**Business implication**\
+Conversion strategies should emphasise convenience and reliability for routine travel. Encouraging casual riders to adopt more regular usage patterns could increase the perceived value of membership.
+
+## Casual rider activity is more seasonally sensitive than member activity
+
+**Observation**\
+Casual rider activity increases significantly during spring and summer, while winter usage is substantially lower. Member activity also follows seasonal trends but is less volatile.
+
+**Interpretation**\
+Casual riders are more influenced by weather and outdoor conditions, reinforcing their leisure-oriented behaviour. Members maintain usage even during less favourable conditions, indicating dependence on the service.
+
+**Business implication**\
+Conversion campaigns should be intensified during peak seasons when casual rider engagement is highest. This is the period when users are most active and most likely to convert.
+
+## Members ride more frequently, while casual riders ride less often but for longer durations
+
+**Observation**\
+Members account for a larger number of total trips, while casual riders have longer trip durations.
+
+**Interpretation**\
+Members use the service as a regular transportation option, whereas casual riders use it occasionally but more intensively per trip.
+
+**Business implication**\
+Membership should be positioned as a value proposition for frequent users. Highlighting cost savings over repeated use can help convert casual riders who exhibit increasing usage frequency.
+
+# Recommendations
+
+The following recommendations are derived directly from the observed behavioural differences between casual riders and members. Each recommendation is designed to support the conversion of casual riders into annual members.
+
+## Focus conversion efforts during peak casual usage periods
+
+Casual rider activity peaks during weekends and in warmer months. Marketing campaigns should be concentrated during these periods to maximise exposure to active users.
+
+This includes: - in-app prompts during weekend rides - seasonal promotions in spring and summer - targeted messaging at high-traffic leisure stations
+
+## Emphasise cost efficiency and convenience for repeat riders
+
+Members exhibit frequent, shorter trips, indicating routine usage. Marketing should highlight how membership reduces cost per trip for users who ride regularly.
+
+Messaging should focus on: - cost savings over multiple rides - ease of access - suitability for daily travel
+
+## Encourage behavioural shift from occasional to regular usage
+
+Casual riders currently use the service for leisure. Strategies should aim to transition them into more consistent users.
+
+This can include: - incentives for repeat usage within short time windows - trial membership offers - ride bundles or loyalty programmes
+
+## Deploy conversion messaging at high-traffic casual rider locations
+
+Station-level analysis shows where casual riders are most active. These locations should be prioritised for targeted campaigns.
+
+This can include: - QR code promotions at stations - geo-targeted app notifications - partnerships with nearby leisure venues
+
+## Align messaging with distinct rider behaviours
+
+Casual riders value flexibility and experience, while members value reliability and efficiency.
+
+Marketing should reflect this: - casual -\> "explore the city" - member -\> "your everyday transport solution"
+
+# Conclusion
+
+This analysis demonstrates that casual riders and annual members exhibit fundamentally different usage patterns, reflecting distinct underlying motivations for using the Cyclistic bike-share service. Casual riders are primarily leisure-oriented, with longer trip durations, strong weekend usage, and higher sensitivity to seasonal conditions. In contrast, members display shorter, more consistent trips aligned with weekday commuting and routine travel.
+
+These behavioural differences highlight that casual riders are not a homogeneous group. Within this segment, there exists a subset of users whose usage patterns begin to resemble those of members, representing the most promising targets for conversion. By identifying when and how casual riders engage with the service, Cyclistic can move beyond generic marketing approaches and implement more precise, data-driven strategies.
+
+The recommendations developed in this analysis focus on targeting high-activity periods, reinforcing the value of membership for repeat users, and aligning messaging with observed rider behaviour. Together, these strategies provide a practical framework for increasing membership conversion while improving the efficiency of marketing efforts.
+
+From a technical perspective, this project establishes a clean, reproducible analytical workflow that integrates data processing, validation, and insight generation. This ensures that findings are both reliable and scalable, supporting future analysis and decision-making within the organisation.
