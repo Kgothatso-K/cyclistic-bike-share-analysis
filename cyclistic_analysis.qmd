@@ -1,7 +1,7 @@
 ---
 title: "Cyclistic Bike-Share Analysis"
 subtitle: "Professional Portfolio Case Study"
-author: "Your Name"
+author: "Kgothatso K. Makwane"
 format:
   html:
     toc: true
